@@ -114,7 +114,53 @@ func (a *api) Unlock(ctx context.Context, req *runtimev1pb.UnlockRequest) (*runt
 }
 
 func (a *api) LockKeepAlive(ctx context.Context, request *runtimev1pb.LockKeepAliveRequest) (*runtimev1pb.LockKeepAliveResponse, error) {
-	return nil, nil
+	// 1. validate
+	if a.lockStores == nil || len(a.lockStores) == 0 {
+		err := status.Error(codes.FailedPrecondition, messages.ErrLockStoresNotConfigured)
+		log.DefaultLogger.Errorf("[runtime] [grpc.LockKeepAlive] error: %v", err)
+		return newInternalErrorLockKeepAliveResponse(), err
+	}
+	if request.ResourceId == "" {
+		err := status.Errorf(codes.InvalidArgument, messages.ErrResourceIdEmpty, request.StoreName)
+		return newInternalErrorLockKeepAliveResponse(), err
+	}
+	if request.LockOwner == "" {
+		err := status.Errorf(codes.InvalidArgument, messages.ErrLockOwnerEmpty, request.StoreName)
+		return newInternalErrorLockKeepAliveResponse(), err
+	}
+	if request.Expire <= 0 {
+		err := status.Errorf(codes.InvalidArgument, messages.ErrExpireNotPositive, request.StoreName)
+		return newInternalErrorLockKeepAliveResponse(), err
+	}
+	// 2. find store component
+	store, ok := a.lockStores[request.StoreName]
+	if !ok {
+		return newInternalErrorLockKeepAliveResponse(), status.Errorf(codes.InvalidArgument, messages.ErrLockStoreNotFound, request.StoreName)
+	}
+	// 3. convert request
+	compReq := LockKeepAliveGrpc2ComponentRequest(request)
+	// modify key
+	var err error
+	compReq.ResourceId, err = runtime_lock.GetModifiedLockKey(compReq.ResourceId, request.StoreName, a.appId)
+	if err != nil {
+		log.DefaultLogger.Errorf("[runtime] [grpc.LockKeepAlive] error: %v", err)
+		return newInternalErrorLockKeepAliveResponse(), err
+	}
+	// 4. delegate to the component
+	compResp, err := store.LockKeepAlive(ctx, compReq)
+	if err != nil {
+		log.DefaultLogger.Errorf("[runtime] [grpc.LockKeepAlive] error: %v", err)
+		return newInternalErrorLockKeepAliveResponse(), err
+	}
+	// 5. convert response
+	resp := LockKeepAliveComp2GrpcResponse(compResp)
+	return resp, nil
+}
+
+func newInternalErrorLockKeepAliveResponse() *runtimev1pb.LockKeepAliveResponse {
+	return &runtimev1pb.LockKeepAliveResponse{
+		Status: runtimev1pb.LockKeepAliveResponse_INTERNAL_ERROR,
+	}
 }
 
 func newInternalErrorUnlockResponse() *runtimev1pb.UnlockResponse {
@@ -160,4 +206,27 @@ func UnlockComp2GrpcResponse(compResp *lock.UnlockResponse) *runtimev1pb.UnlockR
 	}
 	result.Status = runtimev1pb.UnlockResponse_Status(compResp.Status)
 	return result
+}
+
+func LockKeepAliveGrpc2ComponentRequest(req *runtimev1pb.LockKeepAliveRequest) *lock.LockKeepAliveRequest {
+	result := &lock.LockKeepAliveRequest{}
+	if req == nil {
+		return result
+	}
+	result.ResourceId = req.ResourceId
+	result.LockOwner = req.LockOwner
+	result.Expire = req.Expire
+	return result
+}
+
+func LockKeepAliveComp2GrpcResponse(compResp *lock.LockKeepAliveResponse) *runtimev1pb.LockKeepAliveResponse {
+	// Unlike the other conversions, the zero value here means SUCCESS, so a
+	// missing component response (the not-yet-implemented stores return nil,
+	// nil) must not be reported as a successful renewal.
+	if compResp == nil {
+		return newInternalErrorLockKeepAliveResponse()
+	}
+	return &runtimev1pb.LockKeepAliveResponse{
+		Status: runtimev1pb.LockKeepAliveResponse_Status(compResp.Status),
+	}
 }

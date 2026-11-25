@@ -18,6 +18,7 @@ package in_memory
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
@@ -43,14 +44,16 @@ func init() {
 type InMemoryLock struct {
 	features []lock.Feature
 	data     *lockMap
+	// now is the time source used for every lease calculation. It is
+	// time.Now in production and can be replaced in tests so that lease
+	// expiry is deterministic. It is never nil after construction.
+	now func() time.Time
 }
 
 // memoryLock is a lock holder
 type memoryLock struct {
-	key        string
 	owner      string
 	expireTime time.Time
-	lock       int
 }
 
 type lockMap struct {
@@ -59,15 +62,49 @@ type lockMap struct {
 }
 
 func NewInMemoryLock() *InMemoryLock {
+	return newInMemoryLockWithTimeSource(time.Now)
+}
+
+// newInMemoryLockWithTimeSource builds a lock store driven by the given time
+// source. NewInMemoryLock passes time.Now; tests pass a fake clock so that
+// lease expiry can be exercised without sleeping. Keeping this constructor
+// unexported leaves NewInMemoryLock's signature unchanged.
+func newInMemoryLockWithTimeSource(now func() time.Time) *InMemoryLock {
 	once.Do(func() {
 		indicators := &actuators.ComponentsIndicator{ReadinessIndicator: readinessIndicator, LivenessIndicator: livenessIndicator}
 		actuators.SetComponentsIndicator(componentName, indicators)
 	})
+	if now == nil {
+		now = time.Now
+	}
 	return &InMemoryLock{
 		features: make([]lock.Feature, 0),
 		data: &lockMap{
 			locks: make(map[string]*memoryLock),
 		},
+		now: now,
+	}
+}
+
+// isExpired reports whether the lease of item has run out at now. A lease is
+// expired once the clock reaches its deadline, so the deadline itself already
+// belongs to the expired side.
+func isExpired(item *memoryLock, now time.Time) bool {
+	return !item.expireTime.After(now)
+}
+
+// purgeStaleLockLocked removes the entry for resourceId when it no longer
+// protects anything: either its lease has expired, or it has no owner because
+// the holder unlocked it. Such entries are indistinguishable from an absent
+// lock, so dropping them on access keeps lockMap from growing forever without
+// a background goroutine. Callers must hold s.data.
+func (s *InMemoryLock) purgeStaleLockLocked(resourceId string, now time.Time) {
+	item, ok := s.data.locks[resourceId]
+	if !ok {
+		return
+	}
+	if item.owner == "" || isExpired(item, now) {
+		delete(s.data.locks, resourceId)
 	}
 }
 
@@ -78,9 +115,55 @@ func (s *InMemoryLock) Init(_ lock.Metadata) error {
 }
 
 // LockKeepAlive try to renewal lease
+//
+// The lease is recomputed from the current time instead of being extended from
+// the previous deadline: the new deadline is now+Expire. Extending the old
+// deadline would let a client that calls LockKeepAlive repeatedly push the
+// lease arbitrarily far into the future, which defeats the purpose of a
+// bounded lease and delays failure detection of a dead holder.
 func (s *InMemoryLock) LockKeepAlive(ctx context.Context, request *lock.LockKeepAliveRequest) (*lock.LockKeepAliveResponse, error) {
-	//TODO: implemnt function
-	return nil, nil
+	if request == nil {
+		return &lock.LockKeepAliveResponse{
+			Status: lock.INTERNAL_ERROR,
+		}, fmt.Errorf("[inMemoryLock]: nil LockKeepAlive request")
+	}
+	if request.Expire <= 0 {
+		// Invalid arguments are reported as an error, consistent with the
+		// validation TryLock performs in pkg/grpc/default_api/api_lock.go.
+		// INTERNAL_ERROR is set as well so that a caller which ignores the
+		// error still does not read the response as a successful renewal.
+		return &lock.LockKeepAliveResponse{
+			Status: lock.INTERNAL_ERROR,
+		}, fmt.Errorf("[inMemoryLock]: expire must be positive.ResourceId: %s", request.ResourceId)
+	}
+
+	s.data.Lock()
+	defer s.data.Unlock()
+	now := s.now()
+	// 1. An expired lease no longer protects the resource, so drop it before
+	// looking it up. The caller then observes the same LOCK_UNEXIST it would
+	// get for a resource that was never locked.
+	s.purgeStaleLockLocked(request.ResourceId, now)
+	item, ok := s.data.locks[request.ResourceId]
+	if !ok {
+		return &lock.LockKeepAliveResponse{
+			ResourceId: request.ResourceId,
+			Status:     lock.LOCK_UNEXIST,
+		}, nil
+	}
+	// 2. Only the current holder may renew the lease.
+	if item.owner != request.LockOwner {
+		return &lock.LockKeepAliveResponse{
+			ResourceId: request.ResourceId,
+			Status:     lock.LOCK_BELONG_TO_OTHERS,
+		}, nil
+	}
+	// 3. Renew from now.
+	item.expireTime = now.Add(time.Second * time.Duration(request.Expire))
+	return &lock.LockKeepAliveResponse{
+		ResourceId: request.ResourceId,
+		Status:     lock.SUCCESS,
+	}, nil
 }
 
 func (s *InMemoryLock) Features() []lock.Feature {
@@ -91,40 +174,26 @@ func (s *InMemoryLock) Features() []lock.Feature {
 func (s *InMemoryLock) TryLock(ctx context.Context, req *lock.TryLockRequest) (*lock.TryLockResponse, error) {
 	s.data.Lock()
 	defer s.data.Unlock()
-	// 1. Find the memoryLock for this resourceId
-	item, ok := s.data.locks[req.ResourceId]
-	if !ok {
-		item = &memoryLock{
-			key: req.ResourceId,
-			//0 unlock, 1 lock
-			lock: 0,
-		}
-		s.data.locks[req.ResourceId] = item
-	}
+	now := s.now()
 
-	// 2. Construct a new one if the lockData has expired
-	//check expire
-	if item.owner != "" && time.Now().After(item.expireTime) {
-		item = &memoryLock{
-			key:  req.ResourceId,
-			lock: 0,
-		}
-		s.data.locks[req.ResourceId] = item
-	}
+	// 1. Drop the entry when its lease has expired: it must not block a new
+	// holder, and it must not stay in lockMap forever.
+	s.purgeStaleLockLocked(req.ResourceId, now)
 
-	// 3. Check if it has been locked by others.
+	// 2. Check if it has been locked by others.
 	// Currently this is a non-reentrant lock
-	if item.lock == 1 {
+	if _, ok := s.data.locks[req.ResourceId]; ok {
 		//lock failed
 		return &lock.TryLockResponse{
 			Success: false,
 		}, nil
 	}
 
-	// 4. Update owner information
-	item.lock = 1
-	item.owner = req.LockOwner
-	item.expireTime = time.Now().Add(time.Second * time.Duration(req.Expire))
+	// 3. Update owner information
+	s.data.locks[req.ResourceId] = &memoryLock{
+		owner:      req.LockOwner,
+		expireTime: now.Add(time.Second * time.Duration(req.Expire)),
+	}
 
 	return &lock.TryLockResponse{
 		Success: true,
@@ -134,28 +203,27 @@ func (s *InMemoryLock) TryLock(ctx context.Context, req *lock.TryLockRequest) (*
 func (s *InMemoryLock) Unlock(ctx context.Context, req *lock.UnlockRequest) (*lock.UnlockResponse, error) {
 	s.data.Lock()
 	defer s.data.Unlock()
-	// 1. Find the memoryLock for this resourceId
-	item, ok := s.data.locks[req.ResourceId]
+	now := s.now()
 
+	// 1. Drop the entry if it is gone or expired. An expired lease can already
+	// be taken by another owner, so the old holder must not be told SUCCESS.
+	s.purgeStaleLockLocked(req.ResourceId, now)
+
+	// 2. Find the memoryLock for this resourceId
+	item, ok := s.data.locks[req.ResourceId]
 	if !ok {
 		return &lock.UnlockResponse{
 			Status: lock.LOCK_UNEXIST,
 		}, nil
 	}
-	// 2. check the owner information
-	if item.lock != 1 {
-		return &lock.UnlockResponse{
-			Status: lock.LOCK_UNEXIST,
-		}, nil
-	}
+	// 3. check the owner information
 	if item.owner != req.LockOwner {
 		return &lock.UnlockResponse{
 			Status: lock.LOCK_BELONG_TO_OTHERS,
 		}, nil
 	}
-	// 3. unlock and reset the owner information
-	item.owner = ""
-	item.lock = 0
+	// 4. release the lock and remove the entry
+	delete(s.data.locks, req.ResourceId)
 	return &lock.UnlockResponse{
 		Status: lock.SUCCESS,
 	}, nil
